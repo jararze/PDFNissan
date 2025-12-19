@@ -9,5 +9,12 @@ class Charge extends Model
 {
     use HasFactory;
 
+    protected $table = 'charges'; // o el nombre de tu tabla
+
     protected $guarded = [];
+
+    // Agregar esto:
+    protected $casts = [
+        'FECHA' => 'date',
+    ];
 }

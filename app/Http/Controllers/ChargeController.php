@@ -2,175 +2,141 @@
 
 namespace App\Http\Controllers;
 
-use App\Models\Charge;
-use Carbon\Carbon;
-use RecursiveDirectoryIterator;
-use RecursiveIteratorIterator;
-use Smalot\PdfParser\Parser;
+use App\Exports\ChargesExport;
+use App\Services\ChargeProcessorService;
+use Illuminate\Http\Request;
+use Maatwebsite\Excel\Facades\Excel;
 
 class ChargeController extends Controller
 {
+    public function __construct(
+        private ChargeProcessorService $processor
+    ) {}
 
+    /**
+     * Página principal con formulario de upload
+     */
     public function index()
     {
-        return view('control.indez');
+        $pdfDirectory = public_path('pdf/');
+        $hasPendingFiles = false;
+        $pendingCount = 0;
+
+        if (is_dir($pdfDirectory)) {
+            $iterator = new \RecursiveIteratorIterator(
+                new \RecursiveDirectoryIterator($pdfDirectory, \RecursiveDirectoryIterator::SKIP_DOTS)
+            );
+            foreach ($iterator as $file) {
+                if ($file->isFile() && strtolower($file->getExtension()) === 'pdf') {
+                    $pendingCount++;
+                }
+            }
+            $hasPendingFiles = $pendingCount > 0;
+        }
+
+        return view('charges.index', [
+            'hasPendingFiles' => $hasPendingFiles,
+            'pendingCount' => $pendingCount,
+        ]);
     }
 
     /**
-     * Display a listing of the resource.
+     * Sube y extrae un archivo ZIP
+     */
+    public function upload(Request $request)
+    {
+        $request->validate([
+            'zip_file' => 'required|file|mimes:zip|max:102400', // 100MB max
+        ], [
+            'zip_file.required' => 'Debes seleccionar un archivo ZIP.',
+            'zip_file.mimes' => 'El archivo debe ser un ZIP.',
+            'zip_file.max' => 'El archivo no puede superar los 100MB.',
+        ]);
+
+        try {
+            $file = $request->file('zip_file');
+            $zipPath = $file->storeAs('temp', 'upload_' . time() . '.zip');
+            $fullZipPath = storage_path('app/' . $zipPath);
+
+            $result = $this->processor->extractZip($fullZipPath);
+
+            return redirect()->route('charges.index')
+                ->with('success', "ZIP extraído correctamente. {$result['files_count']} archivos PDF encontrados.");
+
+        } catch (\Exception $e) {
+            return redirect()->route('charges.index')
+                ->with('error', 'Error al extraer ZIP: ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * Procesa los PDFs y muestra resultados
      */
     public function generate()
     {
         $directoryPath = public_path('pdf/');
 
         if (!is_dir($directoryPath)) {
-            abort(500, 'Directory not found');
+            return redirect()->route('charges.index')
+                ->with('warning', 'No existe el directorio de PDFs. Sube un archivo ZIP primero.');
         }
 
-        $dirIterator = new RecursiveDirectoryIterator($directoryPath);
-        $iterator = new RecursiveIteratorIterator($dirIterator);
+        try {
+            $results = $this->processor->process($directoryPath);
 
-        $parser = new Parser();
-        $data = [];
-        $fileCount = [];
-        $totals = ['total' => 0, 'procesados' => 0, 'eliminados' => 0];
-
-        foreach ($iterator as $file) {
-            $dirName = $file->getPath();
-            if ($file->isFile() && strtolower($file->getExtension()) === "pdf") {
-                if (!isset($fileCount[$dirName])) {
-                    $fileCount[$dirName] = ['total' => 0, 'procesados' => 0, 'eliminados' => 0];
-                }
-                $fileCount[$dirName]['total']++;
-                $totals['total']++;
+            if ($results['totals']['total'] === 0) {
+                return redirect()->route('charges.index')
+                    ->with('warning', 'No se encontraron archivos PDF para procesar.');
             }
+
+            return view('charges.results', $results);
+
+        } catch (\Exception $e) {
+            return redirect()->route('charges.index')
+                ->with('error', 'Error al procesar: ' . $e->getMessage());
         }
-
-        foreach ($iterator as $file) {
-            $dirName = $file->getPath();
-            if ($file->isFile() && strtolower($file->getExtension()) === "pdf") {
-                $filePath = $file->getRealPath();
-                $relativeFilePath = str_replace(public_path(), '', $filePath);
-                if (!file_exists($filePath)) {
-                    abort(500, 'File not found : '.$filePath);
-                }
-
-                $existsInDatabase = Charge::where('RUTA', $relativeFilePath)->exists();
-
-                if (!$existsInDatabase) {
-                    $pdf = $parser->parseFile($filePath);
-                    $text = $pdf->getText();
-
-
-                    if (strpos($text, 'RECEPCIÓNDEFACTURA') !== false) {
-                        $lines = explode("\n", $text);
-                        $data[] = $this->getDataFromLines($lines, $relativeFilePath);
-                        $fileCount[$dirName]['procesados']++;
-                        $totals['procesados']++;
-                        if (is_writable($filePath)) {
-                            unlink($filePath);
-                            $fileCount[$dirName]['eliminados']++;
-                            $totals['eliminados']++;
-                        } else {
-                            abort(500, 'File cannot be deleted : '.$filePath);
-                        }
-                    }
-                }else{
-                    echo "la factura existe en la base de datos ". $relativeFilePath . "<br>";
-                }
-
-
-            }
-        }
-
-        foreach ($iterator as $file) {
-            if ($file->isDir()) {
-                $files = glob($file->getPathname().'/*');
-                if (empty($files)) {
-                    rmdir($file->getPathname());
-                }
-            }
-        }
-
-        return view('index', ['data' => $data, 'fileCount' => $fileCount, 'totals' => $totals]);
-
     }
 
-    private function getPossibleMount($lines, $positions)
+    /**
+     * Lista todas las facturas procesadas
+     */
+    public function list(Request $request)
     {
-        foreach ($positions as $position) {
-            $possible_mount = array_slice($lines, -$position, 1);
-            if (preg_match("/^[0-9,.]+$/", $possible_mount[0])) {
-                return $possible_mount;
-            }
+        $query = \App\Models\Charge::query();
+
+        if ($request->filled('search')) {
+            $search = $request->input('search');
+            $query->where(function ($q) use ($search) {
+                $q->where('RAZON_SOCIAL', 'like', "%{$search}%")
+                    ->orWhere('NIT', 'like', "%{$search}%")
+                    ->orWhere('FACTURA', 'like', "%{$search}%")
+                    ->orWhere('CONCEPTO', 'like', "%{$search}%");
+            });
         }
-        return [0];
+
+        if ($request->filled('mes')) {
+            $query->where('MES', $request->input('mes'));
+        }
+
+        $charges = $query->orderBy('FECHA', 'desc')->paginate(20);
+
+        return view('charges.list', [
+            'charges' => $charges,
+            'search' => $request->input('search'),
+            'mes' => $request->input('mes'),
+        ]);
     }
 
-    private function getDataFromLines($lines, $relativeFilePath)
+    /**
+     * Exporta las facturas a Excel
+     */
+    public function export(Request $request)
     {
-        $stringConcat = '';
-        for ($i = 23; $i < count($lines); $i++) {
-            $lineParts = explode("\t", $lines[$i]);
-            if (trim($lineParts[0]) === 'SON:') {
-                break;
-            }
-            $stringConcat .= $lines[$i]." ";
-        }
-        $dateSubstring = '';
+        $search = $request->input('search');
+        $mes = $request->input('mes');
 
-        if (strpos($lines[14], 'Referencia') !== false) {
-            $dateSubstring = substr($lines[13], 0, -6);
-            $facturaMonto = preg_replace('/\D/', '', $lines[16]);
-            $codigoQuiter = $lines[14];
-            $nit = $lines[12];
-            $razon_social = $lines[10];
-        } else {
-            $dateSubstring = substr($lines[14], 0, -6);
-            $facturaMonto = preg_replace('/\D/', '', $lines[17]);
-            $codigoQuiter = $lines[15];
-            $nit = $lines[13];
-            $razon_social = $lines[10];
-        }
-        $date = Carbon::createFromFormat('d/m/Y', $dateSubstring)->startOfDay();
+        $filename = 'facturas_' . date('Y-m-d_His') . '.xlsx';
 
-        setlocale(LC_TIME, 'Spanish');
-        $monthInSpanish = $date->formatLocalized('%B');
-
-        $positions = [5, 6, 7];
-
-        $mount = $this->getPossibleMount($lines, $positions);
-        $us = str_replace(",", "", end($mount));
-
-        $slicedArray = array_slice($lines, -4, 1);
-        $observations = str_replace('OBSERVACIONES: ', '', end($slicedArray));
-
-        return Charge::firstOrCreate(
-            ['RUTA' => $relativeFilePath],
-            [
-                'FACTURA' => $facturaMonto,
-                'FECHA' => $date,
-                'MES' => $monthInSpanish,
-                'APLICACION' => '',
-                'RAZON_SOCIAL' => $razon_social,
-                'MARCA' => '',
-                'CAMPANIA' => '',
-                'GRUPO' => '',
-                'CONCEPTO' => $stringConcat,
-                'CANTIDAD_CONCEPTO' => 1,
-                'PRECIO_UNITARIO_EN_BS' => end($mount),
-                'BS' => end($mount),
-                'SUS' => number_format($us / 6.96, 2),
-                'T/C' => '6.96',
-                'CUENTAS_CONTABILIDAD' => '',
-                'CUENTA' => '',
-                'CUENTA2' => '',
-                'CODIGO_QUITER' => str_replace("Referencia: ", "", $codigoQuiter),
-                'OBSERVACIONES' => '',
-                'NIT' => $nit,
-                'OBSERVACIONES2' => $observations,
-                'USUARIO' => str_replace("Usuario:", "", end($lines)),
-                'RUTA' => $relativeFilePath,
-            ]);
+        return Excel::download(new ChargesExport($search, $mes), $filename);
     }
 }
